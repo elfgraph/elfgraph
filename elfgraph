@@ -1,0 +1,346 @@
+#!/usr/bin/env tclsh
+
+package require Tcl 8.6
+package require cmdline 1.5
+
+set font_family "Times"
+set font_size 14
+set palette_iter 0
+
+set palette {
+    antiquewhite3  aqua aquamarine3  azure3 beige  bisque3 black  blanchedalmond
+    blue3 blueviolet brown3 burlywood3  cadetblue3 chartreuse3 chocolate3 coral3
+    cornflowerblue  cornsilk3  crimson  cyan3 darkblue  darkcyan  darkgoldenrod3
+    darkgray   darkgreen  darkkhaki   darkmagenta  darkolivegreen3   darkorange3
+    darkorchid3  darkred darksalmon  darkseagreen3 darkslateblue  darkslategray3
+    darkturquoise darkviolet deeppink deeppink3 deepskyblue deepskyblue3 dimgray
+    dodgerblue  dodgerblue3 firebrick  firebrick3 forestgreen  fuchsia gainsboro
+    gold gold3  goldenrod goldenrod3  gray honeydew3 hotpink  hotpink3 indianred
+    indianred3 indigo ivory3 khaki  khaki3 lavenderblush3 lawngreen lemonchiffon
+    lemonchiffon3  lightblue  lightblue3  lightcoral  lightcyan3  lightgoldenrod
+    lightgoldenrod3  lightgray   lightgreen  lightpink   lightpink3  lightsalmon
+    lightsalmon3   lightseagreen   lightskyblue   lightskyblue3   lightslateblue
+    lightslategray lightsteelblue lightsteelblue3  lightyellow lightyellow3 lime
+    limegreen linen magenta magenta3  maroon maroon3 mediumaquamarine mediumblue
+    mediumorchid   mediumorchid3   mediumpurple   mediumpurple3   mediumseagreen
+    mediumslateblue     mediumspringgreen    mediumturquoise     mediumvioletred
+    midnightblue   mintcream    mistyrose   mistyrose3    moccasin   navajowhite
+    navajowhite3 navy  navyblue none  oldlace olive olivedrab  olivedrab3 orange
+    orange3   orangered  orangered3   orchid  orchid3   palegoldenrod  palegreen
+    palegreen3   paleturquoise   paleturquoise3   palevioletred   palevioletred3
+    papayawhip peachpuff peachpuff3 peru pink pink3 plum plum3 powderblue purple
+    purple3  rebeccapurple red  red3 rosybrown  rosybrown3 royalblue  royalblue3
+    saddlebrown salmon salmon3 sandybrown  seagreen seagreen3 seashell seashell3
+    sienna  sienna3  silver  skyblue  skyblue3  slateblue  slateblue3  slategray
+    slategray3 snow snow3 springgreen springgreen3 steelblue steelblue3 tan tan3
+    teal thistle thistle3 tomato tomato3 transparent turquoise turquoise3 violet
+    violetred violetred3 webgray webgreen webmaroon webpurple wheat wheat3 white
+    whitesmoke x11gray x11green x11maroon x11purple yellow yellow3 yellowgreen
+}
+
+set blacklist {
+    c c++ c++abi dl freetype gcc_s ld-linux-* m pthread resolv rt z
+}
+
+# Cycle through the palette
+proc next_color {} {
+    variable palette_iter
+    variable palette
+    set current_color [lindex $palette $palette_iter]
+    set palette_iter [expr {($palette_iter + 1) % [llength $palette]}]
+    return $current_color
+}
+
+# Strip a file name of its "lib" prefix and ".so*" postfix
+proc lib_name {filename} {
+    if {[regexp "^(lib)?(.*)\.so" $filename m0 m1 m2]} {
+        return $m2
+    } else {
+        return $filename
+    }
+}
+
+proc is_blacklisted {filename} {
+    variable blacklist
+    set libname [lib_name $filename]
+
+    foreach pattern $blacklist {
+        if {[string match $pattern $libname]} {
+            return true
+        }
+    }
+    return false
+}
+
+# Get dependencies of an object file
+proc obj_deps {filepath} {
+    try {
+        set metadata [exec readelf -d $filepath]
+    } on error msg {
+        puts stderr $msg
+        exit 1
+    }
+
+    lmap line [split $metadata "\n"] {
+        if {[regexp {NEEDED.*\[(\S*)\]$} $line m0 m1]} {
+            set line $m1
+        } else {
+            continue
+        }
+    }
+}
+
+# Generate a dict of object file dependencies (non-recursive)
+proc deps_dict {filepaths} {
+    set graph {}
+
+    foreach fp $filepaths {
+        set fn [file tail $fp]
+        dict set graph $fn {}
+
+        if {[is_blacklisted $fn]} {
+            continue
+        }
+
+        foreach dep [obj_deps $fp] {
+            if {![is_blacklisted $dep]} {
+                dict lappend graph $fn $dep
+            }
+        }
+    }
+
+    return $graph
+}
+
+# Aggregate files that refer to the same library
+proc clusterize {graph} {
+    set clusters {}
+    set graph [dict filter $graph script {k v} {
+        expr {$v ne {}}
+    }]
+
+    foreach fn [dict keys $graph] {
+        dict lappend clusters [lib_name $fn] $fn
+    }
+
+    dict filter $clusters script {k v} {
+        expr {[llength $v] > 1}
+    }
+}
+
+proc print_clusters {channel clusters} {
+    dict for {k vs} $clusters {
+        puts $channel "  subgraph \"cluster_$k\" {"
+        foreach v $vs {
+            puts $channel "    \"$v\""
+        }
+        puts $channel "  }"
+    }
+}
+
+proc print_dependencies {channel objs} {
+    dict for {obj deps} $objs {
+        set c [next_color]
+        foreach dep $deps {
+            if {![dict exists $objs $dep]} {
+                set dep "$dep (not found)"
+                puts $channel "  \"$dep\" \[style=dashed, color=gray, fontcolor=gray]"
+            }
+            puts $channel "  \"$obj\" -> \"$dep\" \[color=$c]"
+        }
+    }
+}
+
+proc print_graph {channel filepaths} {
+    set deps [deps_dict $filepaths]
+    set clusters [clusterize $deps]
+
+    puts $channel "digraph G {"
+    print_clusters $channel $clusters
+    print_dependencies $channel $deps
+    puts $channel "}"
+}
+
+# Fish out text nodes created by Graphviz
+proc text_nodes {c} {
+    set nodes {}
+
+    foreach id [$c find all] {
+        if {![catch {$c itemconfigure $id -font}]} {
+            lappend nodes $id
+        }
+    }
+
+    return $nodes
+}
+
+# Fish out not-text nodes created by Graphviz
+proc line_nodes {c} {
+    set nodes {}
+
+    foreach id [$c find all] {
+        if {![catch {$c itemconfigure $id -width} res]
+            && [lindex $res 3] == 1.0
+        } {
+            lappend nodes $id
+        }
+    }
+
+    return $nodes
+}
+
+proc scroll_canvas {canvas_id dx dy} {
+    $canvas_id scan mark 0 0
+    $canvas_id scan dragto $dx $dy 30
+}
+
+proc resize_canvas {canvas_id x y mul} {
+    variable font_family
+    variable font_size
+    set c $canvas_id
+    set cx [$c canvasx $x]
+    set cy [$c canvasy $y]
+    set font_size [expr {$font_size * $mul}]
+    $c scale all $cx $cy $mul $mul
+    $c itemconfigure text -font [list $font_family [expr {round($font_size)}]]
+}
+
+proc recenter_window {} {
+    set wx 100
+    set wy 100
+    set sw [winfo screenwidth .]
+    set sh [winfo screenheight .]
+    set ww [expr {$sw - $wx * 2}]
+    set wh [expr {$sh - $wy * 2}]
+    wm geometry . ${ww}x${wh}+${wx}+${wy}
+}
+
+proc render_graph {canvas_id filepaths} {
+    try {
+        set gv [open "| dot -Ttk" r+]
+    } on error msg {
+        puts stderr "$msg\nmake sure that Graphviz is installed"
+        exit 1
+    }
+
+    print_graph $gv $filepaths
+    close $gv w
+
+    set result [read $gv]
+    close $gv
+
+    set c $canvas_id
+    eval $result
+
+    foreach id [text_nodes $c] {
+        $c addtag text withtag $id
+    }
+
+    foreach id [line_nodes $c] {
+        $c itemconfigure $id -width 2.0
+    }
+}
+
+proc keep_momentum {canvas_id} {
+    variable dragging
+    variable velocity
+    variable last_pos
+
+    if {$dragging} return
+
+    lassign $last_pos last_x last_y
+    lassign $velocity dx dy
+
+    if {abs($dx) < 1 && abs($dy) < 1} return
+
+    set x [expr {round($last_x + $dx)}]
+    set y [expr {round($last_y + $dy)}]
+    set last_pos [list $x $y]
+    set dx [expr {$dx * 0.93}]
+    set dy [expr {$dy * 0.93}]
+    set velocity [list $dx $dy]
+
+    $canvas_id scan dragto $x $y 1
+    after 16 keep_momentum $canvas_id
+}
+
+proc tk_main {argv} {
+    package require Tk
+    wm state . withdrawn
+    wm title . "elfgraph: [lindex $argv 0]"
+    recenter_window
+
+    canvas .c -background white
+    pack .c -fill both -expand true
+
+    bind . <Button-4> { scroll_canvas .c 0  1 }
+    bind . <Button-5> { scroll_canvas .c 0 -1 }
+    bind . <Shift-Button-4> { scroll_canvas .c  1 0 }
+    bind . <Shift-Button-5> { scroll_canvas .c -1 0 }
+    bind . <Control-Button-4> { resize_canvas .c %x %y 1.1 }
+    bind . <Control-Button-5> { resize_canvas .c %x %y 0.9 }
+
+    event add <<DragStart>> <ButtonPress-1>
+    event add <<DragStart>> <ButtonPress-2>
+    event add <<DragEnd>> <ButtonRelease-1>
+    event add <<DragEnd>> <ButtonRelease-2>
+
+    variable dragging false
+    variable velocity {0 0}
+    variable last_pos {0 0}
+
+    bind . <<DragStart>> {
+        .c scan mark %x %y
+        set dragging true
+        set last_pos {%x %y}
+    }
+
+    bind . <<DragEnd>> {
+        set dragging false
+        after 16 keep_momentum .c
+    }
+
+    bind . <Motion> {
+        if {$dragging} {
+            lassign $last_pos last_x last_y
+            set velocity [list [expr {%x - $last_x}] [expr {%y - $last_y}]]
+            set last_pos {%x %y}
+            .c scan dragto %x %y 1
+        }
+    }
+
+    render_graph .c $argv
+    resize_canvas .c 0 0 1.0
+    wm state . normal
+}
+
+proc main {argv} {
+    set options {
+        {T.arg "tk" "Output type: dot,"}
+    }
+
+    set usage "\[options] filename..."
+
+    try {
+        array set params [::cmdline::getoptions argv $options $usage]
+    } trap {CMDLINE USAGE} {msg o} {
+        puts $msg
+        exit 2
+    }
+
+    if {[llength $argv] == 0} {
+        exit
+    }
+
+    switch $params(T) {
+        tk  { tk_main $argv }
+        dot { print_graph stdout $argv }
+        default {
+            puts stderr "Wrong output type: $params(T)\n"
+            puts stderr [::cmdline::usage $options $usage]
+            exit 2
+        }
+    }
+}
+
+main $argv
