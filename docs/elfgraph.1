@@ -1,5 +1,6 @@
 .Dd December 8, 2022
 .Dt elfgraph 1
+.Os
 .Sh NAME
 .Nm elfgraph
 .Nd visualize ELF file dependencies
@@ -43,3 +44,11 @@ The
 output type prints the graph in dot format to stdout.
 
 .El
+.Sh EXAMPLES
+To display a graph of your program's dependencies call:
+.Pp
+.Dl $ elfgraph foo libbar.so libbaz.so
+.Pp
+To export such graph into a PDF, pipe the output into dot:
+.Pp
+.Dl $ elfgraph -T dot foo libbar.so libbaz.so | dot -T pdf >graph.pdf

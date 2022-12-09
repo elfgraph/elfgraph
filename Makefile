@@ -8,6 +8,7 @@ SHELL = /bin/sh
 INSTALL = install
 INSTALL_PROGRAM = $(INSTALL)
 INSTALL_DATA = $(INSTALL) -m 644
+INSTALL_MAN = $(INSTALL_DATA)
 INSTALL_DIR = $(INSTALL) -d
 
 prefix = /usr/local
@@ -26,7 +27,7 @@ install:
 	$(INSTALL_DIR) $(DESTDIR)$(bindir)
 	$(INSTALL_PROGRAM) elfgraph $(DESTDIR)$(bindir)
 	$(INSTALL_DIR) $(DESTDIR)$(man1dir)
-	$(INSTALL_DATA) docs/elfgraph.1 $(DESTDIR)$(man1dir)
+	$(INSTALL_MAN) docs/elfgraph.1 $(DESTDIR)$(man1dir)
 
 uninstall:
 	rm -f $(DESTDIR)$(bindir)/elfgraph
