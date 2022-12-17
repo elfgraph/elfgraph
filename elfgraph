@@ -103,6 +103,11 @@ proc deps_dict {filepaths} {
             continue
         }
 
+        if {[file type $fp] eq "link"} {
+            dict lappend graph $fn [file tail [file link $fp]]
+            continue
+        }
+
         foreach dep [obj_deps $fp] {
             if {![is_blacklisted $dep]} {
                 dict lappend graph $fn $dep
