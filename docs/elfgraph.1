@@ -8,7 +8,9 @@
 .Nm
 .Op Fl h
 .Op Fl T Ar format
-.Op Ar
+.Op Fl b Ar blacklist
+.Op Fl B Ar blacklist
+.Ar
 .Sh DESCRIPTION
 .Nm
 generates a graph of relationships between ELF files: executables and libraries.
@@ -29,21 +31,36 @@ The options are as follows:
 .It Fl h
 Display help.
 
-.It Fl T
+.It Fl T Ar format
 Output type. Two output formats are supported:
-.Cm tk
-(default) and
-.Cm dot .
+.Sy tk No (default) and
+.Sy dot .
 
 The
-.Cm tk
+.Sy tk
 output type creates a window a displays the graph.
 
 The
-.Cm dot
+.Sy dot
 output type prints the graph in dot format to stdout.
 
-.El
+.It Fl b
+Append a comma-separated list of patterns to the default blacklist.
+
+.It Fl B
+Use a custom blacklist. This overrides the default of
+.Qq c,c++,c++abi,dl,gcc_s,ld-*,m,pthread,rt,stdc++
+
+This blacklist is a list of library names or glob patterns that libraries are
+supposed to match against. If a library matches one of the blacklist patterns,
+it's excluded from the graph, even if something depends on it.
+
+The
+.Qq lib
+prefix and the
+.Qq .so
+suffix should be omitted.
+
 .Sh EXAMPLES
 To display a graph of your program's dependencies call:
 .Pp
