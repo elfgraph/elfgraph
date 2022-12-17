@@ -1,3 +1,10 @@
+elfgraph (0.2.0-1) unstable; urgency=medium
+
+  * Added the -b and -B flags to allow blacklist modification;
+  * added support for symbolic links.
+
+ -- Weiss <weiss@unstable.horse>  Sat, 17 Dec 2022 17:04:42 +0100
+
 elfgraph (0.1.1-1) unstable; urgency=medium
 
   * Initial release.
