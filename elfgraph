@@ -39,7 +39,7 @@ set palette {
 }
 
 set blacklist {
-    c c++ c++abi dl freetype gcc_s ld-linux-* m pthread resolv rt z
+    c c++ c++abi dl gcc_s ld-* m pthread rt stdc++
 }
 
 # Cycle through the palette
@@ -69,6 +69,7 @@ proc is_blacklisted {filename} {
             return true
         }
     }
+
     return false
 }
 
@@ -115,14 +116,14 @@ proc deps_dict {filepaths} {
 # Aggregate files that refer to the same library
 proc clusterize {graph} {
     set clusters {}
-    set graph [dict filter $graph script {k v} {
-        expr {$v ne {}}
-    }]
 
     foreach fn [dict keys $graph] {
-        dict lappend clusters [lib_name $fn] $fn
+        if {![is_blacklisted $fn]} {
+            dict lappend clusters [lib_name $fn] $fn
+        }
     }
 
+    # Keep only the clusters of more than one element
     dict filter $clusters script {k v} {
         expr {[llength $v] > 1}
     }
@@ -315,9 +316,13 @@ proc tk_main {argv} {
 }
 
 proc main {argv} {
-    set options {
-        {T.arg "tk" "Output type: dot,"}
-    }
+    variable blacklist
+
+    set options [subst {
+        {T.arg "tk" "Output type: tk, dot; default:"}
+        {b.arg "" "Append to blacklist; default:"}
+        {B.arg [join $blacklist ,] "Set blacklist; default:"}
+    }]
 
     set usage "\[options] filename..."
 
@@ -331,6 +336,9 @@ proc main {argv} {
     if {[llength $argv] == 0} {
         exit
     }
+
+    set blacklist [split $params(B) ,]
+    lappend blacklist {*}[split $params(b) ,]
 
     switch $params(T) {
         tk  { tk_main $argv }
