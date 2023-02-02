@@ -356,4 +356,6 @@ proc main {argv} {
     }
 }
 
-main $argv
+if {[info exists argv0] && $argv0 eq [info script]} {
+    main $argv
+}
