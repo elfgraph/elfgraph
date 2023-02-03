@@ -33,4 +33,13 @@ uninstall:
 	rm -f $(DESTDIR)$(bindir)/elfgraph
 	rm -f $(DESTDIR)$(man1dir)/elfgraph.1*
 
-.PHONY: all install uninstall
+check: tests/libfoo.so
+	cd tests && for f in test_*; do ./$$f; done
+
+tests/libfoo.so: tests/foo.o
+	$(CC) -ldl -fPIC -shared -o $@ $^
+
+clean:
+	rm -f tests/libfoo.so tests/foo.o
+
+.PHONY: all check install uninstall clean

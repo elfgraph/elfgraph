@@ -2,6 +2,363 @@
 
 package require Tcl 8.6
 package require cmdline 1.5
+package require struct::record
+package require TclOO
+
+namespace import struct::record
+namespace import oo::class
+
+namespace eval elf {
+    # Type aliases for binary scan
+    variable type_tab
+
+    array set type_tab {
+        uint16 {su 2}
+        uint32 {iu 4}
+        uint64 {wu 8}
+        int16  {s  2}
+        int32  {i  4}
+        int64  {w  8}
+    }
+
+    # Relevant values for ElfN_Shdr.sh_type (section type)
+    variable sht
+
+    array set sht {
+        strtab 3
+        dynamic 6
+    }
+
+    # Relevant values for ElfN_Dyn.d_tag (dynamic entry type)
+    variable dt
+
+    array set dt {
+        null 0
+        needed 1
+        strtab 5
+    }
+
+    record define ident {
+        { ei_class elfclass32     }
+        { ei_data elfdata2lsb     }
+    }
+
+    record define ehdr {
+        { type      uint16        }
+        { machine   uint16        }
+        { version   uint32        }
+        { entry     uint32/uint64 }
+        { phoff     uint32/uint64 }
+        { shoff     uint32/uint64 }
+        { flags     uint32        }
+        { ehsize    uint16        }
+        { phentsize uint16        }
+        { phnum     uint16        }
+        { shentsize uint16        }
+        { shnum     uint16        }
+        { shstrndx  uint16        }
+    }
+
+    record define shdr {
+        { name      uint32        }
+        { type      uint32        }
+        { flags     uint32/uint64 }
+        { addr      uint32/uint64 }
+        { offset    uint32/uint64 }
+        { size      uint32/uint64 }
+        { link      uint32        }
+        { info      uint32        }
+        { addralign uint32/uint64 }
+        { entsize   uint32/uint64 }
+    }
+
+    record define dyn {
+        { tag int32/int64         }
+        { val uint32/uint64       }
+    }
+
+    # type [in/out] - the field's type
+    # width [out] - the width of the field in bytes
+    # ident [in] - the ELF's ident structure
+    proc select_type {type width ident} {
+        upvar type type_
+        upvar width width_
+
+        set variants [split $type_ /]
+
+        if {[llength $variants] == 2} {
+            switch [$ident.ei_class] {
+                elfclass32 { set type_ [lindex $variants 0] }
+                elfclass64 { set type_ [lindex $variants 1] }
+            }
+        }
+
+        variable type_tab
+        lassign $type_tab($type_) type_ width_
+
+        switch [$ident.ei_data] {
+            elfdata2lsb { set type_ }
+            elfdata2msb { set type_ [string toupper $type_ 0 0] }
+        }
+    }
+
+    proc scan_struct {fd instanceName ident {offset 0}} {
+        set layout {}
+        set size 0
+
+        foreach {property type} [$instanceName] {
+            if {$offset > 0} {
+                incr offset -1
+                continue
+            }
+
+            select_type type width $ident
+            incr size $width
+
+            lappend properties $property
+            lappend layout $type
+        }
+
+        set layout [join $layout ""]
+        set raw_data [read $fd $size]
+
+        binary scan $raw_data $layout {*}$properties
+
+        foreach property $properties {
+            $instanceName configure $property [set $property]
+        }
+
+        return $instanceName
+    }
+
+    proc read_ident {fd} {
+        set ei_nident 16
+        set raw_data [read $fd $ei_nident]
+
+        binary scan $raw_data a4ccc \
+            ei_mag ei_class ei_data ei_version
+
+        verify_ei_mag     $ei_mag
+        verify_ei_version $ei_version
+
+        set ident [ident #auto]
+        $ident configure \
+            -ei_class [verify_ei_class $ei_class] \
+            -ei_data  [verify_ei_data  $ei_data]
+
+        return $ident
+    }
+
+    proc verify_ei_mag {ei_mag} {
+        if {$ei_mag eq "\x7fELF"} {
+            return $ei_mag
+        } else {
+            return -code error "not an ELF file: invalid magic number"
+        }
+    }
+
+    proc verify_ei_class {ei_class} {
+        switch $ei_class {
+            1 { return elfclass32 }
+            2 { return elfclass64 }
+            default { return -code error "unsupported ELF class: $ei_class" }
+        }
+    }
+
+    proc verify_ei_data {ei_data} {
+        switch $ei_data {
+            1 { return elfdata2lsb }
+            2 { return elfdata2msb }
+            default { return -code error "unsupported ELF data: $ei_class" }
+        }
+    }
+
+    proc verify_ei_version {ei_version} {
+        if {$ei_version == 1} {
+            return $ei_version
+        } else {
+            return -code error "unsupported ELF version: $ei_version"
+        }
+    }
+
+    # Read an ELF header at the current offset
+    proc read_elf_header {fd ident} {
+        set h [ehdr #auto]
+        scan_struct $fd $h $ident
+    }
+
+    # Read a section header at the current offset
+    proc read_section_header {fd ident} {
+        set h [shdr #auto]
+        scan_struct $fd $h $ident
+    }
+
+    # Read all section headers in an ELF file, starting at ehdr.shoff
+    proc read_all_section_headers {fd ident ehdr} {
+        set result {}
+        seek $fd [$ehdr.shoff]
+
+        for {set i 0} {$i < [$ehdr.shnum]} {incr i} {
+            set s [read_section_header $fd $ident]
+            lappend result $s
+        }
+
+        # Replace "name" entries with strtab values they point to
+        set shstrtab_hdr [lindex $result [$ehdr.shstrndx]]
+        set shstrtab [section_data $fd $shstrtab_hdr]
+
+        foreach shdr $result {
+            set offset [$shdr.name]
+            $shdr.name [c_str $shstrtab $offset]
+        }
+
+        return $result
+    }
+
+    # Read an entry of a dynamic section at the current offset
+    proc read_dynamic_entry {fd ident} {
+        set ent [dyn #auto]
+        scan_struct $fd $ent $ident
+    }
+
+    proc read_dynamic_section {fd ident shdrs} {
+        variable dt
+
+        set shdrs [find_sections_by_type $shdrs dynamic]
+        if {[llength $shdrs] == 0} { return -code error "no dynamic section found" }
+        lassign $shdrs shdr
+
+        set result {}
+        seek $fd [$shdr.offset]
+
+        while 1 {
+            set ent [read_dynamic_entry $fd $ident]
+            if {[$ent.tag] == $dt(null)} break
+            lappend result $ent
+        }
+
+        return $result
+    }
+
+    proc find_dynamic_entries_by_tag {dyns tag} {
+        variable dt
+
+        lmap dyn $dyns {
+            expr {[$dyn.tag] == $dt($tag) ? $dyn : [continue]}
+        }
+    }
+
+    proc find_section_by_name {shdrs name} {
+        foreach shdr $shdrs {
+            if {[$shdr.name] eq $name} {
+                return $shdr
+            }
+        }
+
+        return -code error "no such section: $name"
+    }
+
+    proc find_sections_by_type {shdrs type} {
+        variable sht
+
+        lmap shdr $shdrs {
+            expr {[$shdr.type] == $sht($type) ? $shdr : [continue]}
+        }
+    }
+
+    # Grab a NULL-terminated substring from binary data at a specfied offset
+    proc c_str {data offset} {
+        set null [string first "\000" $data $offset]
+        string range $data $offset $null-1
+    }
+
+    # Read a section as raw binary data
+    proc section_data {fd shdr} {
+        seek $fd [$shdr.offset]
+        read $fd [$shdr.size]
+    }
+
+    # Return a section's contents as a dictionary that maps offsets to strings
+    proc section_strings {fd shdr} {
+        set raw_data [section_data $fd $shdr]
+        set offset 0
+        set result {}
+
+        while {$offset < [$shdr.size]} {
+            set separator [string first "\000" $raw_data $offset]
+            dict append result $offset [string range $raw_data $offset $separator-1]
+            set offset [expr {$separator + 1}]
+        }
+
+        return $result
+    }
+
+    class create file {
+        variable fn
+        variable fd
+        variable ident
+        variable ehdr
+        variable shdrs
+        variable dyns
+
+        self {
+            method open {filename} {
+                my new $filename
+            }
+        }
+
+        constructor {filename} {
+            set fn $filename
+            set fd [open $filename rb]
+            set ident [elf::read_ident $fd]
+            set ehdr [elf::read_elf_header $fd $ident]
+            set shdrs [elf::read_all_section_headers $fd $ident $ehdr]
+            set dyns [elf::read_dynamic_section $fd $ident $shdrs]
+        }
+
+        destructor {
+            close $fd
+            foreach rec [list $ident $ehdr {*}$shdrs {*}$dyns] {
+                record delete instance $rec
+            }
+        }
+
+        method section_strings {name} {
+            set shdr [elf::find_section_by_name $shdrs $name]
+            elf::section_strings $fd $shdr
+        }
+
+        method _dt_strtab {} {
+            set strtabs [elf::find_sections_by_type $shdrs strtab]
+            set dynents [elf::find_dynamic_entries_by_tag $dyns strtab]
+
+            if {$strtabs eq {}} { return -code error "no STRTAB found" }
+            if {$dynents eq {}} { return -code error "the dynamic section is missing a DT_STRTAB" }
+
+            lassign $dynents dynent; # we only expect a single DT_STRTAB
+
+            foreach strtab $strtabs {
+                if {[$strtab.addr] == [$dynent.val]} {
+                    return [elf::section_data $fd $strtab]
+                }
+            }
+
+            return -code error "DT_STRTAB doesn't match a single SHT_STRTAB"
+        }
+
+        method dt_needed {} {
+            set result {}
+            set strtab [my _dt_strtab]
+
+            lmap dyn [elf::find_dynamic_entries_by_tag $dyns needed] {
+                elf::c_str $strtab [$dyn.val]
+            }
+        }
+    }
+
+    namespace export file
+    namespace ensemble create
+}
 
 set font_family "Times"
 set font_size 14
@@ -75,20 +432,10 @@ proc is_blacklisted {filename} {
 
 # Get dependencies of an object file
 proc obj_deps {filepath} {
-    try {
-        set metadata [exec readelf -d $filepath]
-    } on error msg {
-        puts stderr $msg
-        exit 1
-    }
-
-    lmap line [split $metadata "\n"] {
-        if {[regexp {NEEDED.*\[(\S*)\]$} $line m0 m1]} {
-            set line $m1
-        } else {
-            continue
-        }
-    }
+    set f [elf file open $filepath]
+    set result [$f dt_needed]
+    $f destroy
+    return $result
 }
 
 # Generate a dict of object file dependencies (non-recursive)
@@ -324,8 +671,8 @@ proc main {argv} {
     variable blacklist
 
     set options [subst {
-        {T.arg "tk" "Output type: tk, dot; default:"}
-        {b.arg "" "Append to blacklist; default:"}
+        {T.arg "tk"                "Output type: tk, dot; default:"}
+        {b.arg ""                  "Append to blacklist; default:"}
         {B.arg [join $blacklist ,] "Set blacklist; default:"}
     }]
 

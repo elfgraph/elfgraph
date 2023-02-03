@@ -1,0 +1,17 @@
+#!/usr/bin/env tclsh
+
+source testlib.tcl
+
+test elf_file {
+    set f [elf file open "libfoo.so"]
+    set lib_c [filter [$f dt_needed] {
+        string match "libc.so*"
+    }]
+    set dlopen_deps [filter [$f section_strings ".rodata"] {
+        string match "lib*.so*"
+    }]
+    assert {[llength $lib_c] == 1}
+    assert {$dlopen_deps eq "libbar.so"}
+}
+
+run_tests
