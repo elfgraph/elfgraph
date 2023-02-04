@@ -9,7 +9,62 @@ namespace import struct::record
 namespace import oo::class
 
 namespace eval elf {
-    # Type aliases for binary scan
+    namespace export parser parse
+    namespace ensemble create
+
+    proc parse {filename} {
+        parser new $filename
+    }
+
+    class create parser {
+        variable fn
+        variable fd
+        variable ident
+        variable ehdr
+        variable shdrs
+        variable dyns
+
+        constructor {filename} {
+            namespace path [list {*}[namespace path] ::elf]
+
+            set fn $filename
+            set fd [open $filename rb]
+            set ident [_read_ident $fd]
+            set ehdr [_read_elf_header $fd $ident]
+            set shdrs [_read_all_section_headers $fd $ident $ehdr]
+            set dyns [_read_dynamic_section $fd $ident $shdrs]
+        }
+
+        destructor {
+            close $fd
+            foreach rec [list $ident $ehdr {*}$shdrs {*}$dyns] {
+                record delete instance $rec
+            }
+        }
+
+        # Scans the given section for strings and returns them as a mapping:
+        # offset => string.
+        #
+        # Returns: a dict of integer to string
+        method section_strings {name} {
+            set shdr [_find_section_by_name $shdrs $name]
+            _section_strings $fd $shdr
+        }
+
+        # Finds all DT_NEEDED entries, and returns them as strings.
+        #
+        # Returns: a list of strings
+        method dependencies {} {
+            set result {}
+            set strtab [_dt_strtab $fd $shdrs $dyns]
+
+            lmap dyn [_find_dynamic_entries_by_tag $dyns needed] {
+                _c_str $strtab [$dyn.val]
+            }
+        }
+    }
+
+    # Type aliases for _scan_struct
     variable type_tab
 
     array set type_tab {
@@ -77,10 +132,16 @@ namespace eval elf {
         { val uint32/uint64       }
     }
 
+    # Converts nice, readable type strings you see above into single character
+    # nonsense than binary scan expects. Also, selects the appropriate variant,
+    # depending on ident.
+    #
     # type [in/out] - the field's type
     # width [out] - the width of the field in bytes
     # ident [in] - the ELF's ident structure
-    proc select_type {type width ident} {
+    #
+    # Returns: $type
+    proc _select_type {type width ident} {
         upvar type type_
         upvar width width_
 
@@ -102,7 +163,17 @@ namespace eval elf {
         }
     }
 
-    proc scan_struct {fd instanceName ident {offset 0}} {
+    # Scans ELF headers, section headers and other stuff into records.
+    # Automatically selects appropriate sizes for fields that vary depending on
+    # ident.
+    #
+    # fd [in] - file descriptor
+    # instanceName [in/out] - the record to write data to
+    # ident [in] - ELF ident record
+    # [offset] [in] - an optional offset into the output record
+    #
+    # Returns: instanceName
+    proc _scan_struct {fd instanceName ident {offset 0}} {
         set layout {}
         set size 0
 
@@ -112,7 +183,7 @@ namespace eval elf {
                 continue
             }
 
-            select_type type width $ident
+            _select_type type width $ident
             incr size $width
 
             lappend properties $property
@@ -131,25 +202,31 @@ namespace eval elf {
         return $instanceName
     }
 
-    proc read_ident {fd} {
+    # Reads the first 16 bytes of an ELF file and generates an ident record.
+    # Assumes fd is at the beginning of the file.
+    #
+    # fd [in] - file descriptor
+    #
+    # Returns: an ident record
+    proc _read_ident {fd} {
         set ei_nident 16
         set raw_data [read $fd $ei_nident]
 
         binary scan $raw_data a4ccc \
             ei_mag ei_class ei_data ei_version
 
-        verify_ei_mag     $ei_mag
-        verify_ei_version $ei_version
+        _verify_ei_mag     $ei_mag
+        _verify_ei_version $ei_version
 
         set ident [ident #auto]
         $ident configure \
-            -ei_class [verify_ei_class $ei_class] \
-            -ei_data  [verify_ei_data  $ei_data]
+            -ei_class [_verify_ei_class $ei_class] \
+            -ei_data  [_verify_ei_data  $ei_data]
 
         return $ident
     }
 
-    proc verify_ei_mag {ei_mag} {
+    proc _verify_ei_mag {ei_mag} {
         if {$ei_mag eq "\x7fELF"} {
             return $ei_mag
         } else {
@@ -157,7 +234,7 @@ namespace eval elf {
         }
     }
 
-    proc verify_ei_class {ei_class} {
+    proc _verify_ei_class {ei_class} {
         switch $ei_class {
             1 { return elfclass32 }
             2 { return elfclass64 }
@@ -165,7 +242,7 @@ namespace eval elf {
         }
     }
 
-    proc verify_ei_data {ei_data} {
+    proc _verify_ei_data {ei_data} {
         switch $ei_data {
             1 { return elfdata2lsb }
             2 { return elfdata2msb }
@@ -173,7 +250,7 @@ namespace eval elf {
         }
     }
 
-    proc verify_ei_version {ei_version} {
+    proc _verify_ei_version {ei_version} {
         if {$ei_version == 1} {
             return $ei_version
         } else {
@@ -181,50 +258,57 @@ namespace eval elf {
         }
     }
 
-    # Read an ELF header at the current offset
-    proc read_elf_header {fd ident} {
+    # Reaas an ELF header at the current offset.
+    proc _read_elf_header {fd ident} {
         set h [ehdr #auto]
-        scan_struct $fd $h $ident
+        _scan_struct $fd $h $ident
     }
 
-    # Read a section header at the current offset
-    proc read_section_header {fd ident} {
+    # Reads a section header at the current offset.
+    proc _read_section_header {fd ident} {
         set h [shdr #auto]
-        scan_struct $fd $h $ident
+        _scan_struct $fd $h $ident
     }
 
-    # Read all section headers in an ELF file, starting at ehdr.shoff
-    proc read_all_section_headers {fd ident ehdr} {
+    # Reads all section headers in an ELF file, starting at $ehdr.shoff.
+    proc _read_all_section_headers {fd ident ehdr} {
         set result {}
         seek $fd [$ehdr.shoff]
 
         for {set i 0} {$i < [$ehdr.shnum]} {incr i} {
-            set s [read_section_header $fd $ident]
+            set s [_read_section_header $fd $ident]
             lappend result $s
         }
 
         # Replace "name" entries with strtab values they point to
         set shstrtab_hdr [lindex $result [$ehdr.shstrndx]]
-        set shstrtab [section_data $fd $shstrtab_hdr]
+        set shstrtab [_section_data $fd $shstrtab_hdr]
 
         foreach shdr $result {
             set offset [$shdr.name]
-            $shdr.name [c_str $shstrtab $offset]
+            $shdr.name [_c_str $shstrtab $offset]
         }
 
         return $result
     }
 
-    # Read an entry of a dynamic section at the current offset
-    proc read_dynamic_entry {fd ident} {
+    # Reads an entry of a dynamic section at the current offset.
+    proc _read_dynamic_entry {fd ident} {
         set ent [dyn #auto]
-        scan_struct $fd $ent $ident
+        _scan_struct $fd $ent $ident
     }
 
-    proc read_dynamic_section {fd ident shdrs} {
+    # Reads the contents of a dynamic section.
+    #
+    # fd [in] - file descriptor
+    # ident [in] - an ident record
+    # shdrs [in] - a list of shdr records
+    #
+    # Returns: a list of dyn records
+    proc _read_dynamic_section {fd ident shdrs} {
         variable dt
 
-        set shdrs [find_sections_by_type $shdrs dynamic]
+        set shdrs [_find_sections_by_type $shdrs dynamic]
         if {[llength $shdrs] == 0} { return -code error "no dynamic section found" }
         lassign $shdrs shdr
 
@@ -232,7 +316,7 @@ namespace eval elf {
         seek $fd [$shdr.offset]
 
         while 1 {
-            set ent [read_dynamic_entry $fd $ident]
+            set ent [_read_dynamic_entry $fd $ident]
             if {[$ent.tag] == $dt(null)} break
             lappend result $ent
         }
@@ -240,7 +324,7 @@ namespace eval elf {
         return $result
     }
 
-    proc find_dynamic_entries_by_tag {dyns tag} {
+    proc _find_dynamic_entries_by_tag {dyns tag} {
         variable dt
 
         lmap dyn $dyns {
@@ -248,7 +332,7 @@ namespace eval elf {
         }
     }
 
-    proc find_section_by_name {shdrs name} {
+    proc _find_section_by_name {shdrs name} {
         foreach shdr $shdrs {
             if {[$shdr.name] eq $name} {
                 return $shdr
@@ -258,7 +342,7 @@ namespace eval elf {
         return -code error "no such section: $name"
     }
 
-    proc find_sections_by_type {shdrs type} {
+    proc _find_sections_by_type {shdrs type} {
         variable sht
 
         lmap shdr $shdrs {
@@ -267,20 +351,20 @@ namespace eval elf {
     }
 
     # Grab a NULL-terminated substring from binary data at a specfied offset
-    proc c_str {data offset} {
+    proc _c_str {data offset} {
         set null [string first "\000" $data $offset]
         string range $data $offset $null-1
     }
 
     # Read a section as raw binary data
-    proc section_data {fd shdr} {
+    proc _section_data {fd shdr} {
         seek $fd [$shdr.offset]
         read $fd [$shdr.size]
     }
 
     # Return a section's contents as a dictionary that maps offsets to strings
-    proc section_strings {fd shdr} {
-        set raw_data [section_data $fd $shdr]
+    proc _section_strings {fd shdr} {
+        set raw_data [_section_data $fd $shdr]
         set offset 0
         set result {}
 
@@ -293,416 +377,378 @@ namespace eval elf {
         return $result
     }
 
-    class create file {
-        variable fn
-        variable fd
-        variable ident
-        variable ehdr
-        variable shdrs
-        variable dyns
+    # Finds the DT_STRTAB dynamic section entry and cross-references it with
+    # SHT_STRTAB section headers, then returns the matching section as a
+    # string.
+    #
+    # Returns: a string
+    proc _dt_strtab {fd shdrs dyns} {
+        set strtabs [_find_sections_by_type $shdrs strtab]
+        set dynents [_find_dynamic_entries_by_tag $dyns strtab]
 
-        self {
-            method open {filename} {
-                my new $filename
+        if {$strtabs eq {}} { return -code error "no STRTAB found" }
+        if {$dynents eq {}} { return -code error "the dynamic section is missing a DT_STRTAB" }
+
+        lassign $dynents dynent; # we only expect a single DT_STRTAB
+
+        foreach strtab $strtabs {
+            if {[$strtab.addr] == [$dynent.val]} {
+                return [_section_data $fd $strtab]
             }
         }
 
-        constructor {filename} {
-            set fn $filename
-            set fd [open $filename rb]
-            set ident [elf::read_ident $fd]
-            set ehdr [elf::read_elf_header $fd $ident]
-            set shdrs [elf::read_all_section_headers $fd $ident $ehdr]
-            set dyns [elf::read_dynamic_section $fd $ident $shdrs]
-        }
+        return -code error "DT_STRTAB doesn't match a single SHT_STRTAB"
+    }
+}
 
-        destructor {
-            close $fd
-            foreach rec [list $ident $ehdr {*}$shdrs {*}$dyns] {
-                record delete instance $rec
+namespace eval elfgraph {
+    variable font_family "Times"
+    variable font_size 14
+    variable palette_iter 0
+
+    variable palette {
+        antiquewhite3  aqua aquamarine3  azure3 beige  bisque3 black  blanchedalmond
+        blue3 blueviolet brown3 burlywood3  cadetblue3 chartreuse3 chocolate3 coral3
+        cornflowerblue  cornsilk3  crimson  cyan3 darkblue  darkcyan  darkgoldenrod3
+        darkgray   darkgreen  darkkhaki   darkmagenta  darkolivegreen3   darkorange3
+        darkorchid3  darkred darksalmon  darkseagreen3 darkslateblue  darkslategray3
+        darkturquoise darkviolet deeppink deeppink3 deepskyblue deepskyblue3 dimgray
+        dodgerblue  dodgerblue3 firebrick  firebrick3 forestgreen  fuchsia gainsboro
+        gold gold3  goldenrod goldenrod3  gray honeydew3 hotpink  hotpink3 indianred
+        indianred3 indigo ivory3 khaki  khaki3 lavenderblush3 lawngreen lemonchiffon
+        lemonchiffon3  lightblue  lightblue3  lightcoral  lightcyan3  lightgoldenrod
+        lightgoldenrod3  lightgray   lightgreen  lightpink   lightpink3  lightsalmon
+        lightsalmon3   lightseagreen   lightskyblue   lightskyblue3   lightslateblue
+        lightslategray lightsteelblue lightsteelblue3  lightyellow lightyellow3 lime
+        limegreen linen magenta magenta3  maroon maroon3 mediumaquamarine mediumblue
+        mediumorchid   mediumorchid3   mediumpurple   mediumpurple3   mediumseagreen
+        mediumslateblue     mediumspringgreen    mediumturquoise     mediumvioletred
+        midnightblue   mintcream    mistyrose   mistyrose3    moccasin   navajowhite
+        navajowhite3 navy  navyblue none  oldlace olive olivedrab  olivedrab3 orange
+        orange3   orangered  orangered3   orchid  orchid3   palegoldenrod  palegreen
+        palegreen3   paleturquoise   paleturquoise3   palevioletred   palevioletred3
+        papayawhip peachpuff peachpuff3 peru pink pink3 plum plum3 powderblue purple
+        purple3  rebeccapurple red  red3 rosybrown  rosybrown3 royalblue  royalblue3
+        saddlebrown salmon salmon3 sandybrown  seagreen seagreen3 seashell seashell3
+        sienna  sienna3  silver  skyblue  skyblue3  slateblue  slateblue3  slategray
+        slategray3 snow snow3 springgreen springgreen3 steelblue steelblue3 tan tan3
+        teal thistle thistle3 tomato tomato3 transparent turquoise turquoise3 violet
+        violetred violetred3 webgray webgreen webmaroon webpurple wheat wheat3 white
+        whitesmoke x11gray x11green x11maroon x11purple yellow yellow3 yellowgreen
+    }
+
+    variable blacklist {
+        c c++ c++abi dl gcc_s ld-* m pthread rt stdc++
+    }
+
+    # Cycle through the palette
+    proc next_color {} {
+        variable palette_iter
+        variable palette
+        set current_color [lindex $palette $palette_iter]
+        set palette_iter [expr {($palette_iter + 1) % [llength $palette]}]
+        return $current_color
+    }
+
+    # Strip a file name of its "lib" prefix and ".so*" postfix
+    proc lib_name {filename} {
+        if {[regexp "^(lib)?(.*)\.so" $filename m0 m1 m2]} {
+            return $m2
+        } else {
+            return $filename
+        }
+    }
+
+    proc is_blacklisted {filename} {
+        variable blacklist
+        set libname [lib_name $filename]
+
+        foreach pattern $blacklist {
+            if {[string match $pattern $libname]} {
+                return true
             }
         }
 
-        method section_strings {name} {
-            set shdr [elf::find_section_by_name $shdrs $name]
-            elf::section_strings $fd $shdr
-        }
+        return false
+    }
 
-        method _dt_strtab {} {
-            set strtabs [elf::find_sections_by_type $shdrs strtab]
-            set dynents [elf::find_dynamic_entries_by_tag $dyns strtab]
+    # Get dependencies of an object file
+    proc obj_deps {filepath} {
+        set f [elf parse $filepath]
+        set result [$f dependencies]
+        $f destroy
+        return $result
+    }
 
-            if {$strtabs eq {}} { return -code error "no STRTAB found" }
-            if {$dynents eq {}} { return -code error "the dynamic section is missing a DT_STRTAB" }
+    # Generate a dict of object file dependencies (non-recursive)
+    proc deps_dict {filepaths} {
+        set graph {}
 
-            lassign $dynents dynent; # we only expect a single DT_STRTAB
+        foreach fp $filepaths {
+            set fn [file tail $fp]
+            dict set graph $fn {}
 
-            foreach strtab $strtabs {
-                if {[$strtab.addr] == [$dynent.val]} {
-                    return [elf::section_data $fd $strtab]
+            if {[is_blacklisted $fn]} {
+                continue
+            }
+
+            if {[file type $fp] eq "link"} {
+                dict lappend graph $fn [file tail [file link $fp]]
+                continue
+            }
+
+            foreach dep [obj_deps $fp] {
+                if {![is_blacklisted $dep]} {
+                    dict lappend graph $fn $dep
                 }
             }
-
-            return -code error "DT_STRTAB doesn't match a single SHT_STRTAB"
         }
 
-        method dt_needed {} {
-            set result {}
-            set strtab [my _dt_strtab]
+        return $graph
+    }
 
-            lmap dyn [elf::find_dynamic_entries_by_tag $dyns needed] {
-                elf::c_str $strtab [$dyn.val]
+    # Aggregate files that refer to the same library
+    proc clusterize {graph} {
+        set clusters {}
+
+        foreach fn [dict keys $graph] {
+            if {![is_blacklisted $fn]} {
+                dict lappend clusters [lib_name $fn] $fn
+            }
+        }
+
+        # Keep only the clusters of more than one element
+        dict filter $clusters script {k v} {
+            expr {[llength $v] > 1}
+        }
+    }
+
+    proc print_clusters {channel clusters} {
+        dict for {k vs} $clusters {
+            puts $channel "  subgraph \"cluster_$k\" \{"
+            foreach v $vs {
+                puts $channel "    \"$v\""
+            }
+            puts $channel "  \}"
+        }
+    }
+
+    proc print_dependencies {channel objs} {
+        dict for {obj deps} $objs {
+            set c [next_color]
+            foreach dep $deps {
+                if {![dict exists $objs $dep]} {
+                    set dep "$dep (not found)"
+                    puts $channel "  \"$dep\" \[style=dashed, color=gray, fontcolor=gray]"
+                }
+                puts $channel "  \"$obj\" -> \"$dep\" \[color=$c]"
             }
         }
     }
 
-    namespace export file
+    proc print_graph {channel filepaths} {
+        set deps [deps_dict $filepaths]
+        set clusters [clusterize $deps]
+
+        puts $channel "digraph G \{"
+        print_clusters $channel $clusters
+        print_dependencies $channel $deps
+        puts $channel "\}"
+    }
+
+    # Fish out text nodes created by Graphviz
+    proc text_nodes {c} {
+        set nodes {}
+
+        foreach id [$c find all] {
+            if {![catch {$c itemconfigure $id -font}]} {
+                lappend nodes $id
+            }
+        }
+
+        return $nodes
+    }
+
+    # Fish out not-text nodes created by Graphviz
+    proc line_nodes {c} {
+        set nodes {}
+
+        foreach id [$c find all] {
+            if {![catch {$c itemconfigure $id -width} res]
+                && [lindex $res 3] == 1.0
+            } {
+                lappend nodes $id
+            }
+        }
+
+        return $nodes
+    }
+
+    proc scroll_canvas {canvas_id dx dy} {
+        $canvas_id scan mark 0 0
+        $canvas_id scan dragto $dx $dy 30
+    }
+
+    proc resize_canvas {canvas_id x y mul} {
+        variable font_family
+        variable font_size
+        set c $canvas_id
+        set cx [$c canvasx $x]
+        set cy [$c canvasy $y]
+        set font_size [expr {$font_size * $mul}]
+        $c scale all $cx $cy $mul $mul
+        $c itemconfigure text -font [list $font_family [expr {round($font_size)}]]
+    }
+
+    proc recenter_window {} {
+        set wx 100
+        set wy 100
+        set sw [winfo screenwidth .]
+        set sh [winfo screenheight .]
+        set ww [expr {$sw - $wx * 2}]
+        set wh [expr {$sh - $wy * 2}]
+        wm geometry . ${ww}x${wh}+${wx}+${wy}
+    }
+
+    proc render_graph {canvas_id filepaths} {
+        try {
+            set gv [open "| dot -Ttk" r+]
+        } on error msg {
+            puts stderr "$msg\nmake sure that Graphviz is installed"
+            exit 1
+        }
+
+        print_graph $gv $filepaths
+        close $gv w
+
+        set result [read $gv]
+        close $gv
+
+        set c $canvas_id
+        eval $result
+
+        foreach id [text_nodes $c] {
+            $c addtag text withtag $id
+        }
+
+        foreach id [line_nodes $c] {
+            $c itemconfigure $id -width 2.0
+        }
+    }
+
+    proc keep_momentum {canvas_id} {
+        variable dragging
+        variable velocity
+        variable last_pos
+
+        if {$dragging} return
+
+        lassign $last_pos last_x last_y
+        lassign $velocity dx dy
+
+        if {abs($dx) < 1 && abs($dy) < 1} return
+
+        set x [expr {round($last_x + $dx)}]
+        set y [expr {round($last_y + $dy)}]
+        set last_pos [list $x $y]
+        set dx [expr {$dx * 0.93}]
+        set dy [expr {$dy * 0.93}]
+        set velocity [list $dx $dy]
+
+        $canvas_id scan dragto $x $y 1
+        after 16 keep_momentum $canvas_id
+    }
+
+    proc tk_main {argv} {
+        package require Tk
+        wm state . withdrawn
+        wm title . "elfgraph: [lindex $argv 0]"
+        recenter_window
+
+        canvas .c -background white
+        pack .c -fill both -expand true
+
+        bind . <Button-4> { scroll_canvas .c 0  1 }
+        bind . <Button-5> { scroll_canvas .c 0 -1 }
+        bind . <Shift-Button-4> { scroll_canvas .c  1 0 }
+        bind . <Shift-Button-5> { scroll_canvas .c -1 0 }
+        bind . <Control-Button-4> { resize_canvas .c %x %y 1.1 }
+        bind . <Control-Button-5> { resize_canvas .c %x %y 0.9 }
+
+        event add <<DragStart>> <ButtonPress-1>
+        event add <<DragStart>> <ButtonPress-2>
+        event add <<DragEnd>> <ButtonRelease-1>
+        event add <<DragEnd>> <ButtonRelease-2>
+
+        variable dragging false
+        variable velocity {0 0}
+        variable last_pos {0 0}
+
+        bind . <<DragStart>> {
+            .c scan mark %x %y
+            set dragging true
+            set last_pos {%x %y}
+        }
+
+        bind . <<DragEnd>> {
+            set dragging false
+            after 16 keep_momentum .c
+        }
+
+        bind . <Motion> {
+            if {$dragging} {
+                lassign $last_pos last_x last_y
+                set velocity [list [expr {%x - $last_x}] [expr {%y - $last_y}]]
+                set last_pos {%x %y}
+                .c scan dragto %x %y 1
+            }
+        }
+
+        render_graph .c $argv
+        resize_canvas .c 0 0 1.0
+        wm state . normal
+    }
+
+    proc main {argv} {
+        variable blacklist
+
+        set options [subst {
+            {T.arg "tk"                "Output type: tk, dot; default:"}
+            {b.arg ""                  "Append to blacklist; default:"}
+            {B.arg [join $blacklist ,] "Set blacklist; default:"}
+        }]
+
+        set usage "\[options] filename..."
+
+        try {
+            array set params [::cmdline::getoptions argv $options $usage]
+        } trap {CMDLINE USAGE} {msg o} {
+            puts $msg
+            exit 2
+        }
+
+        if {[llength $argv] == 0} {
+            exit
+        }
+
+        set blacklist [split $params(B) ,]
+        lappend blacklist {*}[split $params(b) ,]
+
+        switch $params(T) {
+            tk  { tk_main $argv }
+            dot { print_graph stdout $argv }
+            default {
+                puts stderr "Wrong output type: $params(T)\n"
+                puts stderr [::cmdline::usage $options $usage]
+                exit 2
+            }
+        }
+    }
+
+    namespace export main
     namespace ensemble create
 }
 
-set font_family "Times"
-set font_size 14
-set palette_iter 0
-
-set palette {
-    antiquewhite3  aqua aquamarine3  azure3 beige  bisque3 black  blanchedalmond
-    blue3 blueviolet brown3 burlywood3  cadetblue3 chartreuse3 chocolate3 coral3
-    cornflowerblue  cornsilk3  crimson  cyan3 darkblue  darkcyan  darkgoldenrod3
-    darkgray   darkgreen  darkkhaki   darkmagenta  darkolivegreen3   darkorange3
-    darkorchid3  darkred darksalmon  darkseagreen3 darkslateblue  darkslategray3
-    darkturquoise darkviolet deeppink deeppink3 deepskyblue deepskyblue3 dimgray
-    dodgerblue  dodgerblue3 firebrick  firebrick3 forestgreen  fuchsia gainsboro
-    gold gold3  goldenrod goldenrod3  gray honeydew3 hotpink  hotpink3 indianred
-    indianred3 indigo ivory3 khaki  khaki3 lavenderblush3 lawngreen lemonchiffon
-    lemonchiffon3  lightblue  lightblue3  lightcoral  lightcyan3  lightgoldenrod
-    lightgoldenrod3  lightgray   lightgreen  lightpink   lightpink3  lightsalmon
-    lightsalmon3   lightseagreen   lightskyblue   lightskyblue3   lightslateblue
-    lightslategray lightsteelblue lightsteelblue3  lightyellow lightyellow3 lime
-    limegreen linen magenta magenta3  maroon maroon3 mediumaquamarine mediumblue
-    mediumorchid   mediumorchid3   mediumpurple   mediumpurple3   mediumseagreen
-    mediumslateblue     mediumspringgreen    mediumturquoise     mediumvioletred
-    midnightblue   mintcream    mistyrose   mistyrose3    moccasin   navajowhite
-    navajowhite3 navy  navyblue none  oldlace olive olivedrab  olivedrab3 orange
-    orange3   orangered  orangered3   orchid  orchid3   palegoldenrod  palegreen
-    palegreen3   paleturquoise   paleturquoise3   palevioletred   palevioletred3
-    papayawhip peachpuff peachpuff3 peru pink pink3 plum plum3 powderblue purple
-    purple3  rebeccapurple red  red3 rosybrown  rosybrown3 royalblue  royalblue3
-    saddlebrown salmon salmon3 sandybrown  seagreen seagreen3 seashell seashell3
-    sienna  sienna3  silver  skyblue  skyblue3  slateblue  slateblue3  slategray
-    slategray3 snow snow3 springgreen springgreen3 steelblue steelblue3 tan tan3
-    teal thistle thistle3 tomato tomato3 transparent turquoise turquoise3 violet
-    violetred violetred3 webgray webgreen webmaroon webpurple wheat wheat3 white
-    whitesmoke x11gray x11green x11maroon x11purple yellow yellow3 yellowgreen
-}
-
-set blacklist {
-    c c++ c++abi dl gcc_s ld-* m pthread rt stdc++
-}
-
-# Cycle through the palette
-proc next_color {} {
-    variable palette_iter
-    variable palette
-    set current_color [lindex $palette $palette_iter]
-    set palette_iter [expr {($palette_iter + 1) % [llength $palette]}]
-    return $current_color
-}
-
-# Strip a file name of its "lib" prefix and ".so*" postfix
-proc lib_name {filename} {
-    if {[regexp "^(lib)?(.*)\.so" $filename m0 m1 m2]} {
-        return $m2
-    } else {
-        return $filename
-    }
-}
-
-proc is_blacklisted {filename} {
-    variable blacklist
-    set libname [lib_name $filename]
-
-    foreach pattern $blacklist {
-        if {[string match $pattern $libname]} {
-            return true
-        }
-    }
-
-    return false
-}
-
-# Get dependencies of an object file
-proc obj_deps {filepath} {
-    set f [elf file open $filepath]
-    set result [$f dt_needed]
-    $f destroy
-    return $result
-}
-
-# Generate a dict of object file dependencies (non-recursive)
-proc deps_dict {filepaths} {
-    set graph {}
-
-    foreach fp $filepaths {
-        set fn [file tail $fp]
-        dict set graph $fn {}
-
-        if {[is_blacklisted $fn]} {
-            continue
-        }
-
-        if {[file type $fp] eq "link"} {
-            dict lappend graph $fn [file tail [file link $fp]]
-            continue
-        }
-
-        foreach dep [obj_deps $fp] {
-            if {![is_blacklisted $dep]} {
-                dict lappend graph $fn $dep
-            }
-        }
-    }
-
-    return $graph
-}
-
-# Aggregate files that refer to the same library
-proc clusterize {graph} {
-    set clusters {}
-
-    foreach fn [dict keys $graph] {
-        if {![is_blacklisted $fn]} {
-            dict lappend clusters [lib_name $fn] $fn
-        }
-    }
-
-    # Keep only the clusters of more than one element
-    dict filter $clusters script {k v} {
-        expr {[llength $v] > 1}
-    }
-}
-
-proc print_clusters {channel clusters} {
-    dict for {k vs} $clusters {
-        puts $channel "  subgraph \"cluster_$k\" {"
-        foreach v $vs {
-            puts $channel "    \"$v\""
-        }
-        puts $channel "  }"
-    }
-}
-
-proc print_dependencies {channel objs} {
-    dict for {obj deps} $objs {
-        set c [next_color]
-        foreach dep $deps {
-            if {![dict exists $objs $dep]} {
-                set dep "$dep (not found)"
-                puts $channel "  \"$dep\" \[style=dashed, color=gray, fontcolor=gray]"
-            }
-            puts $channel "  \"$obj\" -> \"$dep\" \[color=$c]"
-        }
-    }
-}
-
-proc print_graph {channel filepaths} {
-    set deps [deps_dict $filepaths]
-    set clusters [clusterize $deps]
-
-    puts $channel "digraph G {"
-    print_clusters $channel $clusters
-    print_dependencies $channel $deps
-    puts $channel "}"
-}
-
-# Fish out text nodes created by Graphviz
-proc text_nodes {c} {
-    set nodes {}
-
-    foreach id [$c find all] {
-        if {![catch {$c itemconfigure $id -font}]} {
-            lappend nodes $id
-        }
-    }
-
-    return $nodes
-}
-
-# Fish out not-text nodes created by Graphviz
-proc line_nodes {c} {
-    set nodes {}
-
-    foreach id [$c find all] {
-        if {![catch {$c itemconfigure $id -width} res]
-            && [lindex $res 3] == 1.0
-        } {
-            lappend nodes $id
-        }
-    }
-
-    return $nodes
-}
-
-proc scroll_canvas {canvas_id dx dy} {
-    $canvas_id scan mark 0 0
-    $canvas_id scan dragto $dx $dy 30
-}
-
-proc resize_canvas {canvas_id x y mul} {
-    variable font_family
-    variable font_size
-    set c $canvas_id
-    set cx [$c canvasx $x]
-    set cy [$c canvasy $y]
-    set font_size [expr {$font_size * $mul}]
-    $c scale all $cx $cy $mul $mul
-    $c itemconfigure text -font [list $font_family [expr {round($font_size)}]]
-}
-
-proc recenter_window {} {
-    set wx 100
-    set wy 100
-    set sw [winfo screenwidth .]
-    set sh [winfo screenheight .]
-    set ww [expr {$sw - $wx * 2}]
-    set wh [expr {$sh - $wy * 2}]
-    wm geometry . ${ww}x${wh}+${wx}+${wy}
-}
-
-proc render_graph {canvas_id filepaths} {
-    try {
-        set gv [open "| dot -Ttk" r+]
-    } on error msg {
-        puts stderr "$msg\nmake sure that Graphviz is installed"
-        exit 1
-    }
-
-    print_graph $gv $filepaths
-    close $gv w
-
-    set result [read $gv]
-    close $gv
-
-    set c $canvas_id
-    eval $result
-
-    foreach id [text_nodes $c] {
-        $c addtag text withtag $id
-    }
-
-    foreach id [line_nodes $c] {
-        $c itemconfigure $id -width 2.0
-    }
-}
-
-proc keep_momentum {canvas_id} {
-    variable dragging
-    variable velocity
-    variable last_pos
-
-    if {$dragging} return
-
-    lassign $last_pos last_x last_y
-    lassign $velocity dx dy
-
-    if {abs($dx) < 1 && abs($dy) < 1} return
-
-    set x [expr {round($last_x + $dx)}]
-    set y [expr {round($last_y + $dy)}]
-    set last_pos [list $x $y]
-    set dx [expr {$dx * 0.93}]
-    set dy [expr {$dy * 0.93}]
-    set velocity [list $dx $dy]
-
-    $canvas_id scan dragto $x $y 1
-    after 16 keep_momentum $canvas_id
-}
-
-proc tk_main {argv} {
-    package require Tk
-    wm state . withdrawn
-    wm title . "elfgraph: [lindex $argv 0]"
-    recenter_window
-
-    canvas .c -background white
-    pack .c -fill both -expand true
-
-    bind . <Button-4> { scroll_canvas .c 0  1 }
-    bind . <Button-5> { scroll_canvas .c 0 -1 }
-    bind . <Shift-Button-4> { scroll_canvas .c  1 0 }
-    bind . <Shift-Button-5> { scroll_canvas .c -1 0 }
-    bind . <Control-Button-4> { resize_canvas .c %x %y 1.1 }
-    bind . <Control-Button-5> { resize_canvas .c %x %y 0.9 }
-
-    event add <<DragStart>> <ButtonPress-1>
-    event add <<DragStart>> <ButtonPress-2>
-    event add <<DragEnd>> <ButtonRelease-1>
-    event add <<DragEnd>> <ButtonRelease-2>
-
-    variable dragging false
-    variable velocity {0 0}
-    variable last_pos {0 0}
-
-    bind . <<DragStart>> {
-        .c scan mark %x %y
-        set dragging true
-        set last_pos {%x %y}
-    }
-
-    bind . <<DragEnd>> {
-        set dragging false
-        after 16 keep_momentum .c
-    }
-
-    bind . <Motion> {
-        if {$dragging} {
-            lassign $last_pos last_x last_y
-            set velocity [list [expr {%x - $last_x}] [expr {%y - $last_y}]]
-            set last_pos {%x %y}
-            .c scan dragto %x %y 1
-        }
-    }
-
-    render_graph .c $argv
-    resize_canvas .c 0 0 1.0
-    wm state . normal
-}
-
-proc main {argv} {
-    variable blacklist
-
-    set options [subst {
-        {T.arg "tk"                "Output type: tk, dot; default:"}
-        {b.arg ""                  "Append to blacklist; default:"}
-        {B.arg [join $blacklist ,] "Set blacklist; default:"}
-    }]
-
-    set usage "\[options] filename..."
-
-    try {
-        array set params [::cmdline::getoptions argv $options $usage]
-    } trap {CMDLINE USAGE} {msg o} {
-        puts $msg
-        exit 2
-    }
-
-    if {[llength $argv] == 0} {
-        exit
-    }
-
-    set blacklist [split $params(B) ,]
-    lappend blacklist {*}[split $params(b) ,]
-
-    switch $params(T) {
-        tk  { tk_main $argv }
-        dot { print_graph stdout $argv }
-        default {
-            puts stderr "Wrong output type: $params(T)\n"
-            puts stderr [::cmdline::usage $options $usage]
-            exit 2
-        }
-    }
-}
-
 if {[info exists argv0] && $argv0 eq [info script]} {
-    main $argv
+    elfgraph main $argv
 }
