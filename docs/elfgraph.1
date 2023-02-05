@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl h
+.Op Fl l
 .Op Fl T Ar format
 .Op Fl b Ar blacklist
 .Op Fl B Ar blacklist
@@ -30,6 +31,27 @@ The options are as follows:
 .Bl -tag -width Ds
 .It Fl h
 Display help.
+
+.It Fl l
+Enable dlopen scanning. The dlopen scanner sacrifices accuracy for speed
+and uses a very simple heuristic:
+
+.Bl -dash
+.It
+check if the file in question or any of its dependencies use dlopen;
+.It
+look for strings that kind of look like library names in the .rodata
+section;
+.It
+display them, and if the file uses dlopen directly, also add a (+dl)
+mark to its node.
+.El
+
+This approach means that there might be false positives. But, it's very
+fast and usually correct...
+
+Needless to say, if the program in question loads library names from
+external sources (like configuration files), those wont be detected.
 
 .It Fl T Ar format
 Output type. Two output formats are supported:
