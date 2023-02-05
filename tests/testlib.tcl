@@ -25,8 +25,8 @@ proc run_tests {} {
         try {
             $test
             puts "ok"
-        } on error e {
-            puts stderr "failed on $e"
+        } on error {result err} {
+            puts stderr "failed on [dict get $err -errorinfo]\n"
             set rc 1
         }
     }

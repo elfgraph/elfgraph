@@ -2,16 +2,26 @@
 
 source testlib.tcl
 
-test elf_parse {
+test elf_dependencies {
     set f [elf parse "libfoo.so"]
+
     set lib_c [filter [$f dependencies] {
         string match "libc.so*"
     }]
     set dlopen_deps [filter [$f section_strings ".rodata"] {
         string match "lib*.so*"
     }]
+
     assert {[llength $lib_c] == 1}
     assert {$dlopen_deps eq "libbar.so"}
+
+    $f destroy
+}
+
+test elf_symtab {
+    set f [elf parse "libfoo.so"]
+    dict get [$f symbols] dlopen
+    $f destroy
 }
 
 run_tests

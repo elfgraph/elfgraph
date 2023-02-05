@@ -42,6 +42,10 @@ namespace eval elf {
             }
         }
 
+        method filename {} {
+            file tail $fn
+        }
+
         # Scans the given section for strings and returns them as a mapping:
         # offset => string.
         #
@@ -55,12 +59,29 @@ namespace eval elf {
         #
         # Returns: a list of strings
         method dependencies {} {
-            set result {}
             set strtab [_dt_strtab $fd $shdrs $dyns]
 
             lmap dyn [_find_dynamic_entries_by_tag $dyns needed] {
                 _c_str $strtab [$dyn.val]
             }
+        }
+
+        # Retrieves dynamic symbols (the ones from the .dynsym table) and their
+        # types: def or und. def means the symbol is defined in the ELF file,
+        # und means it's external.
+        #
+        # Returns: a dict of {string => string} - maps symbol names to their
+        # type (def/und)
+        method symbols {} {
+            set dynsyms [_find_sections_by_type $shdrs dynsym]
+            if {[llength $dynsyms] == 0} {
+                return -code error "no SHT_DYNSYM section found"
+            }
+
+            set dynsym_hdr [lindex $dynsyms 0]
+            set strtab_hdr [lindex $shdrs [$dynsym_hdr.link]]
+
+            _read_symtab $fd $dynsym_hdr $strtab_hdr $ident
         }
     }
 
@@ -68,9 +89,11 @@ namespace eval elf {
     variable type_tab
 
     array set type_tab {
+        uint8 {cu 1}
         uint16 {su 2}
         uint32 {iu 4}
         uint64 {wu 8}
+        int8   {c  1}
         int16  {s  2}
         int32  {i  4}
         int64  {w  8}
@@ -80,22 +103,23 @@ namespace eval elf {
     variable sht
 
     array set sht {
-        strtab 3
+        strtab  3
         dynamic 6
+        dynsym  11
     }
 
     # Relevant values for ElfN_Dyn.d_tag (dynamic entry type)
     variable dt
 
     array set dt {
-        null 0
+        null   0
         needed 1
         strtab 5
     }
 
     record define ident {
-        { ei_class elfclass32     }
-        { ei_data elfdata2lsb     }
+        { ei_class  elfclass32    }
+        { ei_data   elfdata2lsb   }
     }
 
     record define ehdr {
@@ -128,8 +152,26 @@ namespace eval elf {
     }
 
     record define dyn {
-        { tag int32/int64         }
-        { val uint32/uint64       }
+        { tag       int32/int64   }
+        { val       uint32/uint64 }
+    }
+
+    record define elf32_sym {
+        { name      uint32        }
+        { value     uint32        }
+        { size      uint32        }
+        { info      uint8         }
+        { other     uint8         }
+        { shndx     uint16        }
+    }
+
+    record define elf64_sym {
+        { name      uint32        }
+        { info      uint8         }
+        { other     uint8         }
+        { shndx     uint16        }
+        { value     uint64        }
+        { size      uint64        }
     }
 
     # Converts nice, readable type strings you see above into single character
@@ -172,7 +214,7 @@ namespace eval elf {
     # ident [in] - ELF ident record
     # [offset] [in] - an optional offset into the output record
     #
-    # Returns: instanceName
+    # Returns: integer - the amount of bytes read
     proc _scan_struct {fd instanceName ident {offset 0}} {
         set layout {}
         set size 0
@@ -199,7 +241,7 @@ namespace eval elf {
             $instanceName configure $property [set $property]
         }
 
-        return $instanceName
+        return $size
     }
 
     # Reads the first 16 bytes of an ELF file and generates an ident record.
@@ -262,12 +304,14 @@ namespace eval elf {
     proc _read_elf_header {fd ident} {
         set h [ehdr #auto]
         _scan_struct $fd $h $ident
+        return $h
     }
 
     # Reads a section header at the current offset.
     proc _read_section_header {fd ident} {
         set h [shdr #auto]
         _scan_struct $fd $h $ident
+        return $h
     }
 
     # Reads all section headers in an ELF file, starting at $ehdr.shoff.
@@ -296,6 +340,7 @@ namespace eval elf {
     proc _read_dynamic_entry {fd ident} {
         set ent [dyn #auto]
         _scan_struct $fd $ent $ident
+        return $ent
     }
 
     # Reads the contents of a dynamic section.
@@ -370,6 +415,7 @@ namespace eval elf {
 
         while {$offset < [$shdr.size]} {
             set separator [string first "\000" $raw_data $offset]
+            if {$separator == -1} break
             dict append result $offset [string range $raw_data $offset $separator-1]
             set offset [expr {$separator + 1}]
         }
@@ -399,12 +445,41 @@ namespace eval elf {
 
         return -code error "DT_STRTAB doesn't match a single SHT_STRTAB"
     }
-}
+
+    proc _read_symtab {fd symtab_hdr strtab_hdr ident} {
+        set strtab [_section_data $fd $strtab_hdr]
+
+        seek $fd [$symtab_hdr.offset]
+        set size [$symtab_hdr.size]
+        set bytes_read 0
+        set result {}
+
+        while {$bytes_read < $size} {
+            switch [$ident.ei_class] {
+                elfclass32 { set sym [elf32_sym #auto] }
+                elfclass64 { set sym [elf64_sym #auto] }
+            }
+
+            incr bytes_read [_scan_struct $fd $sym $ident]
+            set name [_c_str $strtab [$sym.name]]
+            set type [expr {[$sym.shndx] == 0 ? "def" : "und"}]
+
+            if {$name ne ""} {
+                dict set result [_c_str $strtab [$sym.name]] $type
+            }
+
+            record delete instance $sym
+        }
+
+        return $result
+    }
+};# namespace elf
 
 namespace eval elfgraph {
     variable font_family "Times"
     variable font_size 14
     variable palette_iter 0
+    variable params
 
     variable palette {
         antiquewhite3  aqua aquamarine3  azure3 beige  bisque3 black  blanchedalmond
@@ -441,6 +516,22 @@ namespace eval elfgraph {
         c c++ c++abi dl gcc_s ld-* m pthread rt stdc++
     }
 
+    variable arrow_style
+
+    array set arrow_style {
+        regular solid
+        dlopen dashed
+        link solid
+    }
+
+    record define graph_node {
+        { is_dynamic false }
+        parser
+        label
+        link
+        deps
+    }
+
     # Cycle through the palette
     proc next_color {} {
         variable palette_iter
@@ -472,36 +563,101 @@ namespace eval elfgraph {
         return false
     }
 
-    # Get dependencies of an object file
-    proc obj_deps {filepath} {
-        set f [elf parse $filepath]
-        set result [$f dependencies]
-        $f destroy
-        return $result
+    proc dlopen_deps {elf} {
+        set fn [$elf filename]
+        lmap str [$elf section_strings .rodata] {
+            expr {[string match "lib*.so*" $str] && !($str eq $fn)
+                  ? [list $str dlopen]
+                  : [continue]}
+        }
+    }
+
+    proc mark_dynamic_nodes {graph} {
+        foreach filename [dict keys $graph] {
+            check_dlopen_dependency $graph $filename
+        }
+    }
+
+    proc check_dlopen_dependency {graph filename} {
+        if {![dict exists $graph $filename]} {
+            return false
+        }
+
+        set node [dict get $graph $filename]
+
+        if {[$node.is_dynamic]} {
+            return true
+        }
+        if {[$node.link] ne {}} {
+            return [check_dlopen_dependency $graph [$node.link]]
+        }
+
+        set elf [$node.parser]
+
+        if {[dict exists [$elf symbols] dlopen]} {
+            $node.is_dynamic true
+            $node.label "[$node.label] (+dl)"
+            return true
+        }
+
+        foreach dep [$node.deps] {
+            lassign $dep dep_name
+            if {$dep_name eq $filename} \
+                continue
+            if {[check_dlopen_dependency $graph $dep_name]} {
+                $node.is_dynamic true
+                return true
+            }
+        }
+
+        return false
+    }
+
+    proc scan_for_dlopen_deps {graph} {
+        dict for {fn node} $graph {
+            if {![$node.is_dynamic]} continue
+
+            set deps [dlopen_deps [$node.parser]]
+            lappend deps {*}[$node.deps]
+            $node.deps [lsort -index 0 -unique $deps]
+        }
     }
 
     # Generate a dict of object file dependencies (non-recursive)
     proc deps_dict {filepaths} {
+        variable params
+
         set graph {}
 
         foreach fp $filepaths {
             set fn [file tail $fp]
-            dict set graph $fn {}
 
             if {[is_blacklisted $fn]} {
                 continue
             }
 
+            set node [graph_node #auto]
+            dict set graph $fn $node
+            $node.label $fn
+
             if {[file type $fp] eq "link"} {
-                dict lappend graph $fn [file tail [file link $fp]]
+                $node.link [file tail [file link $fp]]
                 continue
             }
 
-            foreach dep [obj_deps $fp] {
+            $node.parser [elf parse $fp]
+            $node.deps [lmap dep [[$node.parser] dependencies] {
                 if {![is_blacklisted $dep]} {
-                    dict lappend graph $fn $dep
+                    list $dep regular
+                } else {
+                    continue
                 }
-            }
+            }]
+        }
+
+        if {$params(l)} {
+            mark_dynamic_nodes $graph
+            scan_for_dlopen_deps $graph
         }
 
         return $graph
@@ -511,9 +667,9 @@ namespace eval elfgraph {
     proc clusterize {graph} {
         set clusters {}
 
-        foreach fn [dict keys $graph] {
+        dict for {fn node} $graph {
             if {![is_blacklisted $fn]} {
-                dict lappend clusters [lib_name $fn] $fn
+                dict lappend clusters [lib_name $fn] [$node.label]
             }
         }
 
@@ -533,15 +689,37 @@ namespace eval elfgraph {
         }
     }
 
-    proc print_dependencies {channel objs} {
-        dict for {obj deps} $objs {
+    proc print_dependencies {channel graph} {
+        variable arrow_style
+
+        dict for {fn node} $graph {
             set c [next_color]
-            foreach dep $deps {
-                if {![dict exists $objs $dep]} {
-                    set dep "$dep (not found)"
-                    puts $channel "  \"$dep\" \[style=dashed, color=gray, fontcolor=gray]"
+            set link [$node.link]
+
+            if {$link ne {}} {
+                if {![dict exists $graph $link]} {
+                    set link "$link (not found)"
+                    puts $channel "  \"$link\" \[style=dashed, color=gray, fontcolor=gray]"
+                } else {
+                    set link [[dict get $graph $link].label]
                 }
-                puts $channel "  \"$obj\" -> \"$dep\" \[color=$c]"
+                puts $channel "  \"[$node.label]\" -> \"$link\" \[label=link, style=dotted, color=$c, fontcolor=$c]"
+                continue
+            }
+
+            foreach dep [$node.deps] {
+                lassign $dep dep_name dep_type
+                switch $dep_type {
+                    regular { set arrow_text ""   }
+                    dlopen  { set arrow_text "dl" }
+                }
+                if {![dict exists $graph $dep_name]} {
+                    set dep_name "$dep_name (not found)"
+                    puts $channel "  \"$dep_name\" \[style=dashed, color=gray, fontcolor=gray]"
+                } else {
+                    set dep_name [[dict get $graph $dep_name].label]
+                }
+                puts $channel "  \"[$node.label]\" -> \"$dep_name\" \[label=\"$arrow_text\", style=$arrow_style($dep_type), color=$c, fontcolor=$c]"
             }
         }
     }
@@ -656,7 +834,36 @@ namespace eval elfgraph {
         set velocity [list $dx $dy]
 
         $canvas_id scan dragto $x $y 1
-        after 16 keep_momentum $canvas_id
+        after 16 ::elfgraph::keep_momentum $canvas_id
+    }
+
+    proc on_drag_start {x y} {
+        variable dragging
+        variable last_pos
+
+        .c scan mark $x $y
+        set dragging true
+        set last_pos [list $x $y]
+    }
+
+    proc on_drag_end {} {
+        variable dragging
+
+        set dragging false
+        after 16 ::elfgraph::keep_momentum .c
+    }
+
+    proc on_motion {x y} {
+        variable dragging
+        variable last_pos
+        variable velocity
+
+        if {$dragging} {
+            lassign $last_pos last_x last_y
+            set velocity [list [expr {$x - $last_x}] [expr {$y - $last_y}]]
+            set last_pos [list $x $y]
+            .c scan dragto $x $y 1
+        }
     }
 
     proc tk_main {argv} {
@@ -668,12 +875,12 @@ namespace eval elfgraph {
         canvas .c -background white
         pack .c -fill both -expand true
 
-        bind . <Button-4> { scroll_canvas .c 0  1 }
-        bind . <Button-5> { scroll_canvas .c 0 -1 }
-        bind . <Shift-Button-4> { scroll_canvas .c  1 0 }
-        bind . <Shift-Button-5> { scroll_canvas .c -1 0 }
-        bind . <Control-Button-4> { resize_canvas .c %x %y 1.1 }
-        bind . <Control-Button-5> { resize_canvas .c %x %y 0.9 }
+        bind . <Button-4> { ::elfgraph::scroll_canvas .c 0  1 }
+        bind . <Button-5> { ::elfgraph::scroll_canvas .c 0 -1 }
+        bind . <Shift-Button-4> { ::elfgraph::scroll_canvas .c  1 0 }
+        bind . <Shift-Button-5> { ::elfgraph::scroll_canvas .c -1 0 }
+        bind . <Control-Button-4> { ::elfgraph::resize_canvas .c %x %y 1.1 }
+        bind . <Control-Button-5> { ::elfgraph::resize_canvas .c %x %y 0.9 }
 
         event add <<DragStart>> <ButtonPress-1>
         event add <<DragStart>> <ButtonPress-2>
@@ -685,23 +892,15 @@ namespace eval elfgraph {
         variable last_pos {0 0}
 
         bind . <<DragStart>> {
-            .c scan mark %x %y
-            set dragging true
-            set last_pos {%x %y}
+            ::elfgraph::on_drag_start %x %y
         }
 
         bind . <<DragEnd>> {
-            set dragging false
-            after 16 keep_momentum .c
+            ::elfgraph::on_drag_end
         }
 
         bind . <Motion> {
-            if {$dragging} {
-                lassign $last_pos last_x last_y
-                set velocity [list [expr {%x - $last_x}] [expr {%y - $last_y}]]
-                set last_pos {%x %y}
-                .c scan dragto %x %y 1
-            }
+            ::elfgraph::on_motion %x %y
         }
 
         render_graph .c $argv
@@ -711,8 +910,10 @@ namespace eval elfgraph {
 
     proc main {argv} {
         variable blacklist
+        variable params
 
         set options [subst {
+            {l                         "Detect dlopen dependencies"}
             {T.arg "tk"                "Output type: tk, dot; default:"}
             {b.arg ""                  "Append to blacklist; default:"}
             {B.arg [join $blacklist ,] "Set blacklist; default:"}
